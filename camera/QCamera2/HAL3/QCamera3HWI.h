@@ -328,7 +328,9 @@ private:
 
     void addToPPFeatureMask(int stream_format, uint32_t stream_idx);
     void updateFpsInPreviewBuffer(metadata_buffer_t *metadata, uint32_t frame_number);
-
+#ifndef USE_HAL_3_3
+    void updateTimeStampInPendingBuffers(uint32_t frameNumber, nsecs_t timestamp);
+#endif
     void enablePowerHint();
     void disablePowerHint();
     int32_t dynamicUpdateMetaStreamInfo();
@@ -365,7 +367,7 @@ private:
     QCamera3SupportChannel *mAnalysisChannel;
     QCamera3RawDumpChannel *mRawDumpChannel;
     QCamera3RegularChannel *mDummyBatchChannel;
-    QCameraPerfLockMgr mPerfLockMgr;
+    QCameraPerfLock m_perfLock;
     QCameraCommon   mCommon;
 
     uint32_t mChannelHandle;
@@ -488,7 +490,6 @@ private:
     uint32_t mFirstFrameNumberInBatch;
     camera3_stream_t mDummyBatchStream;
     bool mNeedSensorRestart;
-    bool mPreviewStarted;
     uint32_t mMinInFlightRequests;
     uint32_t mMaxInFlightRequests;
 
@@ -498,6 +499,7 @@ private:
     /* Ldaf calibration data */
     bool mLdafCalibExist;
     uint32_t mLdafCalib[2];
+    bool mPowerHintEnabled;
     int32_t mLastCustIntentFrmNum;
     CameraMetadata  mCachedMetadata;
 

@@ -245,14 +245,14 @@ const QCamera3HardwareInterface::QCameraMap<
     { ANDROID_LENS_STATE_MOVING,        CAM_AF_LENS_STATE_MOVING}
 };
 
-const int32_t available_thumbnail_sizes[] = {0, 0,
-                                             176, 144,
+const int32_t available_thumbnail_sizes[] = {176, 144,
                                              240, 144,
                                              256, 144,
                                              240, 160,
                                              256, 154,
                                              240, 240,
-                                             320, 240};
+                                             320, 240,
+                                               0, 0  };
 
 const QCamera3HardwareInterface::QCameraMap<
         camera_metadata_enum_android_sensor_test_pattern_mode_t,
@@ -341,7 +341,7 @@ QCamera3HardwareInterface::QCamera3HardwareInterface(uint32_t cameraId,
       mAnalysisChannel(NULL),
       mRawDumpChannel(NULL),
       mDummyBatchChannel(NULL),
-      mPerfLockMgr(),
+      m_perfLock(),
       mCommon(),
       mChannelHandle(0),
       mFirstConfiguration(true),
@@ -369,10 +369,10 @@ QCamera3HardwareInterface::QCamera3HardwareInterface(uint32_t cameraId,
       mOpMode(CAMERA3_STREAM_CONFIGURATION_NORMAL_MODE),
       mFirstFrameNumberInBatch(0),
       mNeedSensorRestart(false),
-      mPreviewStarted(false),
       mMinInFlightRequests(MIN_INFLIGHT_REQUESTS),
       mMaxInFlightRequests(MAX_INFLIGHT_REQUESTS),
       mLdafCalibExist(false),
+      mPowerHintEnabled(false),
       mLastCustIntentFrmNum(-1),
       mState(CLOSED),
       mIsDeviceLinked(false),
@@ -384,6 +384,7 @@ QCamera3HardwareInterface::QCamera3HardwareInterface(uint32_t cameraId,
       mUseAVTimer(false)
 {
     getLogLevel();
+    m_perfLock.lock_init();
     mCommon.init(gCamCapability[cameraId]);
     mCameraDevice.common.tag = HARDWARE_DEVICE_TAG;
 #ifndef USE_HAL_3_3
@@ -469,9 +470,11 @@ QCamera3HardwareInterface::~QCamera3HardwareInterface()
 
     int32_t rc = 0;
 
-    // Disable power hint and enable the perf lock for close camera
-    mPerfLockMgr.releasePerfLock(PERF_LOCK_POWERHINT_ENCODE);
-    mPerfLockMgr.acquirePerfLock(PERF_LOCK_CLOSE_CAMERA);
+    /* Turn off current power hint before acquiring perfLock in case they
+     * conflict with each other */
+    disablePowerHint();
+
+    m_perfLock.lock_acq();
 
     // unlink of dualcam
     if (mIsDeviceLinked) {
@@ -602,7 +605,8 @@ QCamera3HardwareInterface::~QCamera3HardwareInterface()
         if (mDefaultMetadata[i])
             free_camera_metadata(mDefaultMetadata[i]);
 
-    mPerfLockMgr.releasePerfLock(PERF_LOCK_CLOSE_CAMERA);
+    m_perfLock.lock_rel();
+    m_perfLock.lock_deinit();
 
     pthread_cond_destroy(&mRequestCond);
     pthread_cond_destroy(&mBuffersCond);
@@ -698,17 +702,17 @@ int QCamera3HardwareInterface::openCamera(struct hw_device_t **hw_device)
         return PERMISSION_DENIED;
     }
 
-    mPerfLockMgr.acquirePerfLock(PERF_LOCK_OPEN_CAMERA);
+    m_perfLock.lock_acq();
     LOGI("[KPI Perf]: E PROFILE_OPEN_CAMERA camera id %d",
              mCameraId);
 
     rc = openCamera();
     if (rc == 0) {
         *hw_device = &mCameraDevice.common;
-    } else {
+    } else
         *hw_device = NULL;
-    }
 
+    m_perfLock.lock_rel();
     LOGI("[KPI Perf]: X PROFILE_OPEN_CAMERA camera id %d, rc: %d",
              mCameraId, rc);
 
@@ -1197,6 +1201,42 @@ int32_t QCamera3HardwareInterface::getSensorOutputSize(cam_dimension_t &sensor_d
 }
 
 /*==============================================================================
+ * FUNCTION   : enablePowerHint
+ *
+ * DESCRIPTION: enable single powerhint for preview and different video modes.
+ *
+ * PARAMETERS :
+ *
+ * RETURN     : NULL
+ *
+ *==========================================================================*/
+void QCamera3HardwareInterface::enablePowerHint()
+{
+    if (!mPowerHintEnabled) {
+        m_perfLock.powerHint(POWER_HINT_VIDEO_ENCODE, true);
+        mPowerHintEnabled = true;
+    }
+}
+
+/*==============================================================================
+ * FUNCTION   : disablePowerHint
+ *
+ * DESCRIPTION: disable current powerhint.
+ *
+ * PARAMETERS :
+ *
+ * RETURN     : NULL
+ *
+ *==========================================================================*/
+void QCamera3HardwareInterface::disablePowerHint()
+{
+    if (mPowerHintEnabled) {
+        m_perfLock.powerHint(POWER_HINT_VIDEO_ENCODE, false);
+        mPowerHintEnabled = false;
+    }
+}
+
+/*==============================================================================
  * FUNCTION   : addToPPFeatureMask
  *
  * DESCRIPTION: add additional features to pp feature mask based on
@@ -1292,6 +1332,39 @@ void QCamera3HardwareInterface::updateFpsInPreviewBuffer(metadata_buffer_t *meta
     }
 }
 
+#ifndef USE_HAL_3_3
+/*==============================================================================
+ * FUNCTION   : updateTimeStampInPendingBuffers
+ *
+ * DESCRIPTION: update timestamp in display metadata for all pending buffers
+ *              of a frame number
+ *
+ * PARAMETERS :
+ *   @frame_number: frame_number. Timestamp will be set on pending buffers of this frame number
+ *   @timestamp   : timestamp to be set
+ *
+ * RETURN     : None
+ *
+ *==========================================================================*/
+void QCamera3HardwareInterface::updateTimeStampInPendingBuffers(
+        uint32_t frameNumber, nsecs_t timestamp)
+{
+    for (auto req = mPendingBuffersMap.mPendingBuffersInRequest.begin();
+            req != mPendingBuffersMap.mPendingBuffersInRequest.end(); req++) {
+        if (req->frame_number != frameNumber)
+            continue;
+
+        for (auto k = req->mPendingBufferList.begin();
+                k != req->mPendingBufferList.end(); k++ ) {
+            struct private_handle_t *priv_handle =
+                    (struct private_handle_t *) (*(k->buffer));
+            setMetaData(priv_handle, SET_VT_TIMESTAMP, &timestamp);
+        }
+    }
+    return;
+}
+#endif
+
 /*===========================================================================
  * FUNCTION   : configureStreams
  *
@@ -1311,9 +1384,9 @@ int QCamera3HardwareInterface::configureStreams(
     int rc = 0;
 
     // Acquire perfLock before configure streams
-    mPerfLockMgr.acquirePerfLock(PERF_LOCK_START_PREVIEW);
+    m_perfLock.lock_acq();
     rc = configureStreamsPerfLocked(streamList);
-    mPerfLockMgr.releasePerfLock(PERF_LOCK_START_PREVIEW);
+    m_perfLock.lock_rel();
 
     return rc;
 }
@@ -3047,6 +3120,13 @@ void QCamera3HardwareInterface::handleMetadataWithLock(
 
             i->timestamp = capture_time;
 
+#ifndef USE_HAL_3_3
+            /* Set the timestamp in display metadata so that clients aware of
+               private_handle such as VT can use this un-modified timestamps.
+               Camera framework is unaware of this timestamp and cannot change this */
+            updateTimeStampInPendingBuffers(i->frame_number, i->timestamp);
+#endif
+
             // Find channel requiring metadata, meaning internal offline postprocess
             // is needed.
             //TODO: for now, we don't support two streams requiring metadata at the same time.
@@ -3204,8 +3284,15 @@ void QCamera3HardwareInterface::hdrPlusPerfLock(
     if ((p_frame_number_valid != NULL) && *p_frame_number_valid) {
         if ((p_frame_number != NULL) &&
                 (mLastCustIntentFrmNum == (int32_t)*p_frame_number)) {
-            mPerfLockMgr.acquirePerfLock(PERF_LOCK_TAKE_SNAPSHOT, HDR_PLUS_PERF_TIME_OUT);
+            m_perfLock.lock_acq_timed(HDR_PLUS_PERF_TIME_OUT);
         }
+    }
+
+    //release lock after perf lock timer is expired. If lock is already released,
+    //isTimerReset returns false
+    if (m_perfLock.isTimerReset()) {
+        mLastCustIntentFrmNum = -1;
+        m_perfLock.lock_rel_timed();
     }
 }
 
@@ -3292,11 +3379,6 @@ void QCamera3HardwareInterface::handleBufferWithLock(
     camera3_stream_buffer_t *buffer, uint32_t frame_number)
 {
     ATRACE_CALL();
-
-    if (buffer->stream->format == HAL_PIXEL_FORMAT_BLOB) {
-        mPerfLockMgr.releasePerfLock(PERF_LOCK_TAKE_SNAPSHOT);
-    }
-
     /* Nothing to be done during error state */
     if ((ERROR == mState) || (DEINIT == mState)) {
         return;
@@ -3409,18 +3491,6 @@ void QCamera3HardwareInterface::handleBufferWithLock(
             }
         }
     }
-
-    if (mPreviewStarted == false) {
-        QCamera3Channel *channel = (QCamera3Channel *)buffer->stream->priv;
-        if ((1U << CAM_STREAM_TYPE_PREVIEW) == channel->getStreamTypeMask()) {
-            mPerfLockMgr.releasePerfLock(PERF_LOCK_START_PREVIEW);
-            mPerfLockMgr.releasePerfLock(PERF_LOCK_OPEN_CAMERA);
-            mPreviewStarted = true;
-
-            // Set power hint for preview
-            mPerfLockMgr.acquirePerfLock(PERF_LOCK_POWERHINT_ENCODE, 0);
-        }
-    }
 }
 
 /*===========================================================================
@@ -3517,7 +3587,7 @@ int QCamera3HardwareInterface::processCaptureRequest(
                 return rc;
             }
         }
-        mPerfLockMgr.acquirePerfLock(PERF_LOCK_START_PREVIEW);
+        m_perfLock.lock_acq();
         /* get eis information for stream configuration */
         cam_is_type_t is_type;
         char is_type_value[PROPERTY_VALUE_MAX];
@@ -3897,12 +3967,15 @@ int QCamera3HardwareInterface::processCaptureRequest(
 
         goto no_error;
 error_exit:
-        mPerfLockMgr.releasePerfLock(PERF_LOCK_START_PREVIEW);
+        m_perfLock.lock_rel();
         return rc;
 no_error:
+        m_perfLock.lock_rel();
+
         mWokenUpByDaemon = false;
         mPendingLiveRequest = 0;
         mFirstConfiguration = false;
+        enablePowerHint();
     }
 
     uint32_t frameNumber = request->frame_number;
@@ -3972,7 +4045,6 @@ no_error:
 
     if (blob_request) {
         KPI_ATRACE_INT("SNAPSHOT", 1);
-        mPerfLockMgr.acquirePerfLock(PERF_LOCK_TAKE_SNAPSHOT);
     }
     if (blob_request && mRawDumpChannel) {
         LOGD("Trigger Raw based on blob request if Raw dump is enabled");
